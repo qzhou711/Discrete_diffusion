@@ -28,6 +28,12 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 from transformers import GenerationConfig, TextStreamer
 from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList, LogitsWarper
 from data.item_processor import FlexARItemProcessor, FlexARItemProcessor_Action, FlexARItemProcessor_Action_State
@@ -123,8 +129,30 @@ class PretrainSolverBase_ck_action_head(ABC):
         if self.global_rank == 0:
             (Path(args.output_dir) / "tensorboard").mkdir(parents=True, exist_ok=True)
             self.log_writer = SummaryWriter(log_dir=str(Path(args.output_dir) / "tensorboard"))
+            
+            # Initialize wandb if available and environment variables are set
+            self.wandb_run = None
+            if WANDB_AVAILABLE:
+                wandb_project = os.environ.get("WANDB_PROJECT")
+                wandb_name = os.environ.get("WANDB_NAME")
+                wandb_entity = os.environ.get("WANDB_ENTITY")
+                wandb_dir = os.environ.get("WANDB_DIR", str(args.output_dir))
+                
+                if wandb_project:  # Only init if project is set
+                    wandb_config = {
+                        "project": wandb_project,
+                        "name": wandb_name if wandb_name else f"{Path(args.output_dir).name}",
+                        "dir": wandb_dir,
+                        "config": vars(args),
+                    }
+                    if wandb_entity:
+                        wandb_config["entity"] = wandb_entity
+                    
+                    self.wandb_run = wandb.init(**wandb_config)
+                    self.logger.info(f"Initialized wandb: project={wandb_project}, name={wandb_config['name']}")
         else:
             self.log_writer = None
+            self.wandb_run = None
         
         self.item_processor = FlexARItemProcessor(target_size=288, tokenizer=self.args.tokenizer_path)
         self.item_processor_action = ItemProcessor(target_size=256, tokenizer=self.args.tokenizer_path)
@@ -755,6 +783,8 @@ class PretrainSolverBase_ck_action_head(ABC):
             if self.global_rank == 0:
                 if self.log_writer is not None:
                     self.log_writer.flush()
+                if self.wandb_run is not None:
+                    self.wandb_run.log(log_stats, step=epoch)
                 with open(os.path.join(self.args.output_dir, "log_train.txt"), mode="a", encoding="utf-8") as f:
                     f.write(json.dumps(log_stats) + "\n")
             
@@ -778,6 +808,8 @@ class PretrainSolverBase_ck_action_head(ABC):
             if self.global_rank == 0:
                 if self.log_writer is not None:
                     self.log_writer.flush()
+                if self.wandb_run is not None:
+                    self.wandb_run.log(log_stats, step=epoch)
                 with open(os.path.join(self.args.output_dir, "log_eval_ind.txt"), mode="a", encoding="utf-8") as f:
                     f.write(json.dumps(log_stats) + "\n")
             
@@ -796,6 +828,8 @@ class PretrainSolverBase_ck_action_head(ABC):
             if self.global_rank == 0:
                 if self.log_writer is not None:
                     self.log_writer.flush()
+                if self.wandb_run is not None:
+                    self.wandb_run.log(log_stats, step=epoch)
                 with open(os.path.join(self.args.output_dir, "log_eval_ood.txt"), mode="a", encoding="utf-8") as f:
                     f.write(json.dumps(log_stats) + "\n")
 

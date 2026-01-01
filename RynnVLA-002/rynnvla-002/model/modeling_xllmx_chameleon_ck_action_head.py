@@ -350,6 +350,12 @@ class ChameleonXLLMXForConditionalGeneration_ck_action_head(ChameleonForConditio
         else:
             attention_mask = self.generate_att_mask_3(input_ids)
         # import pdb; pdb.set_trace()
+        
+        # Remove arguments from kwargs that are explicitly passed to avoid duplicate arguments
+        kwargs.pop('attention_mask', None)
+        kwargs.pop('input_ids', None)
+        kwargs.pop('labels', None)
+        kwargs.pop('use_cache', None)
                 
         # explicit use_cache=False for the following
         # https://github.com/Lightning-AI/pytorch-lightning/issues/19267

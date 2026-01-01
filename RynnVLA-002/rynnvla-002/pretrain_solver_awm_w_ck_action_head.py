@@ -1,4 +1,6 @@
 import pickle
+import os
+from pathlib import Path
 from typing import List, Tuple
 
 from accelerate import init_empty_weights
@@ -7,6 +9,12 @@ import torch
 from model import ChameleonXLLMXConfig, ChameleonXLLMXForConditionalGeneration_ck_action_head
 from xllmx.data.item_processor import ItemProcessorBase
 from xllmx.solvers.pretrain import PretrainSolverBase_ck_action_head
+
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
 
 
 class ItemProcessor(ItemProcessorBase):
@@ -55,6 +63,12 @@ class Solver(PretrainSolverBase_ck_action_head):
         parser.add_argument("--with_world_model", action='store_true')
         parser.add_argument("--resolution", type=int, default=256, choices=[256, 512])
         parser.add_argument("--tokenizer_path", type=str, default="../ckpts/models--Alpha-VLLM--Lumina-mGPT-7B-768/snapshots/9624463a82ea5ce814af9b561dcd08a31082c3af")
+        # LoRA parameters
+        parser.add_argument("--use_lora", action="store_true", help="Use LoRA for efficient training")
+        parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+        parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
+        parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
+        parser.add_argument("--lora_target_modules", type=str, default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj", help="Comma-separated list of target modules for LoRA")
         return parser
 
     def _model_func(
@@ -62,25 +76,64 @@ class Solver(PretrainSolverBase_ck_action_head):
         init_from: str,
     ) -> (ChameleonXLLMXForConditionalGeneration_ck_action_head, None):
 
+        # Check if init_from is a valid checkpoint (has config.json)
+        # If not, it might be a checkpoint directory without config, use the base model path
+        init_path = Path(init_from)
+        has_config = (init_path / "config.json").exists() if init_path.is_dir() else False
+        
+        # If it's a checkpoint directory without config.json, use the base model from args.init_from
+        # This handles the case where auto_resume finds a checkpoint but it's incomplete
+        if not has_config and hasattr(self.args, 'init_from') and self.args.init_from:
+            # Check if the original init_from is different and valid
+            original_init = Path(self.args.init_from)
+            if original_init.exists() and ((original_init / "config.json").exists() if original_init.is_dir() else True):
+                # Use original init_from for config, but we'll load weights from resume_path later
+                base_model_path = str(original_init)
+            else:
+                base_model_path = init_from
+        else:
+            base_model_path = init_from
+
         # Only instantiate the model on rank0
         # Other ranks will receive the model weights from rank0 during FSDP wrapping (through `sync_module_states`)
         # See https://github.com/pytorch/pytorch/issues/105840
         if self.dp_rank == 0:
-            model = ChameleonXLLMXForConditionalGeneration_ck_action_head.from_pretrained(
-                init_from,
-                action_dim=self.args.action_dim,
-                time_horizon=self.args.time_horizon,
-                max_position_embeddings=self.args.max_seq_len,
-                mask_image_logits=self.args.mask_image_logits,
-                dropout=self.args.dropout,
-                z_loss_weight=self.args.z_loss_weight,
-                torch_dtype=torch.bfloat16,
-                device_map="cpu",
-            )
+            # Disable automatic adapter loading to avoid PEFT version issues
+            # Temporarily rename adapter_config.json if it exists to prevent auto-loading
+            adapter_config_path = Path(base_model_path) / "adapter_config.json" if Path(base_model_path).is_dir() else None
+            adapter_renamed = False
+            temp_adapter_config = None
+            if adapter_config_path and adapter_config_path.exists():
+                temp_adapter_config = str(adapter_config_path) + ".tmp"
+                try:
+                    os.rename(str(adapter_config_path), temp_adapter_config)
+                    adapter_renamed = True
+                except Exception:
+                    adapter_renamed = False
+            
+            try:
+                model = ChameleonXLLMXForConditionalGeneration_ck_action_head.from_pretrained(
+                    base_model_path,
+                    action_dim=self.args.action_dim,
+                    time_horizon=self.args.time_horizon,
+                    max_position_embeddings=self.args.max_seq_len,
+                    mask_image_logits=self.args.mask_image_logits,
+                    dropout=self.args.dropout,
+                    z_loss_weight=self.args.z_loss_weight,
+                    torch_dtype=torch.bfloat16,
+                    device_map="cpu",
+                )
+            finally:
+                # Restore adapter config if it was renamed
+                if adapter_renamed and temp_adapter_config:
+                    try:
+                        os.rename(temp_adapter_config, str(adapter_config_path))
+                    except Exception:
+                        pass
         else:
             with init_empty_weights():
                 config = ChameleonXLLMXConfig.from_pretrained(
-                    init_from,
+                    base_model_path,
                     action_dim=self.args.action_dim,
                     time_horizon=self.args.time_horizon,
                     max_position_embeddings=self.args.max_seq_len,
@@ -92,6 +145,31 @@ class Solver(PretrainSolverBase_ck_action_head):
                 model = ChameleonXLLMXForConditionalGeneration_ck_action_head(config)
 
         del model.model.vqmodel
+
+        # Apply LoRA if requested
+        # Note: LoRA should be applied on all ranks to ensure model structure consistency for FSDP
+        if hasattr(self.args, 'use_lora') and self.args.use_lora:
+            if not PEFT_AVAILABLE:
+                raise ImportError("PEFT library is required for LoRA training. Please install it with: pip install peft")
+            
+            # Check if model already has LoRA adapters (from checkpoint)
+            # If so, we don't need to apply again
+            if hasattr(model, 'peft_config') and len(model.peft_config) > 0:
+                if self.dp_rank == 0:
+                    print("Model already has LoRA adapters loaded from checkpoint, skipping LoRA application")
+            else:
+                target_modules = [m.strip() for m in self.args.lora_target_modules.split(',')]
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=self.args.lora_r,
+                    lora_alpha=self.args.lora_alpha,
+                    lora_dropout=self.args.lora_dropout,
+                    target_modules=target_modules,
+                    bias="none",
+                )
+                model = get_peft_model(model, lora_config)
+                if self.dp_rank == 0:
+                    model.print_trainable_parameters()
 
         return model, None
 
